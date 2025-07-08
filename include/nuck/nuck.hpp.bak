@@ -1,0 +1,132 @@
+#pragma once
+
+#include "math.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
+namespace nuck {
+
+constexpr float SLEEP_LINEAR_THRESHOLD = 0.01F;
+constexpr float SLEEP_TIME_THRESHOLD = 0.5F;
+constexpr int CELL_SIZE = 128;
+
+struct CellPosition {
+    int x, y;
+    bool operator==(const CellPosition& other) const {
+        return x == other.x && y == other.y;
+    }
+};
+CellPosition get_cell_position(float x, float y);
+struct CellHasher {
+    std::size_t operator()(const CellPosition& cell) const {
+        return std::hash<int>()(cell.x) ^ (std::hash<int>()(cell.y) << 1);
+    }
+};
+
+enum class ObjectType : std::uint8_t {
+    DYNAMIC,
+    STATIC,
+    KINEMATIC,
+};
+
+struct Object {
+    ObjectType type;
+    math::Vector2 position;
+    math::Vector2 size;
+    math::Vector2 velocity;
+    math::Vector2 force;
+    float mass;
+    bool is_sleeping = false;
+    float sleep_timer = 0.0F;
+};
+
+struct AABB {
+    math::Vector2 max;
+    math::Vector2 min;
+};
+AABB compute_AABB(const Object& object);
+bool AABB_overlap(const AABB& a, const AABB& b);
+
+struct ObjectID {
+    uint32_t index;
+    uint32_t generation;
+};
+inline bool operator==(ObjectID one, ObjectID other) {
+    return one.index == other.index && one.generation == other.generation;
+}
+inline bool operator!=(ObjectID one, ObjectID other) {
+    return one.index != other.index || one.generation != other.generation;
+}
+
+struct Collision {
+    ObjectID a;
+    ObjectID b;
+};
+
+class World {
+  private:
+    std::vector<Object> m_objects;
+    std::vector<uint32_t> m_generations;
+    std::vector<uint32_t> m_free_indexes;
+    std::unordered_map<CellPosition, std::vector<ObjectID>, CellHasher> m_spatial_grid;
+    std::vector<Collision> m_collisions;
+
+    void simulate_gravity(Object* object, float delta_time);
+    void update_spatial_grid();
+    std::vector<ObjectID> query_region(const AABB& bounds);
+
+  public:
+    math::Vector2 world_gravity{ math::Vector2Zero() };
+    struct Iterator {
+      private:
+        World* m_world;
+        size_t m_index;
+
+        void advance_to_next_valid() {
+            while (m_index < m_world->m_objects.size()
+                   && std::ranges::find(m_world->m_free_indexes, m_index)
+                       != m_world->m_free_indexes.end()) {
+                m_index = m_index + 1;
+            }
+        }
+
+      public:
+        Iterator(World* world, size_t start) : m_world(world), m_index(start) {
+            advance_to_next_valid();
+        }
+
+        bool operator!=(const Iterator& other) const {
+            return m_index != other.m_index;
+        }
+        Iterator& operator++() {
+            ++m_index;
+            advance_to_next_valid();
+            return *this;
+        }
+        ObjectID operator*() {
+            return ObjectID{ static_cast<uint32_t>(m_index),
+                             m_world->m_generations[m_index] };
+        }
+    };
+
+    Iterator begin() {
+        return Iterator(this, 0);
+    }
+
+    Iterator end() {
+        return Iterator(this, m_objects.size());
+    }
+
+    ObjectID create_object(math::Vector2 position, math::Vector2 size, float mass, ObjectType type);
+    Object* get_object(ObjectID object_id);
+    void destroy_object(ObjectID object_id);
+    const std::vector<Collision>& get_collisions() const;
+    bool is_colliding(ObjectID id) const;
+    bool are_colliding(ObjectID a, ObjectID b) const;
+    std::vector<Collision> get_collisions_for(ObjectID id) const;
+    void step(float delta_time);
+};
+
+} // namespace nuck

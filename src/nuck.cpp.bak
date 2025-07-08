@@ -1,0 +1,213 @@
+#include "nuck/nuck.hpp"
+#include "nuck/math.hpp"
+#include <algorithm>
+#include <cmath>
+#include <unordered_set>
+
+namespace nuck {
+
+CellPosition get_cell_position(float x, float y) {
+    return CellPosition{ .x = static_cast<int>(std::floor(x / CELL_SIZE)),
+                         .y = static_cast<int>(std::floor(y / CELL_SIZE)) };
+}
+
+AABB compute_AABB(const Object& object) {
+    AABB box;
+    box.max = math::Vector2{ object.position.x + object.size.x,
+                             object.position.y + object.size.y };
+    box.min = object.position;
+    return box;
+}
+bool AABB_overlap(const AABB& a, const AABB& b) {
+    return (
+        a.min.x < b.max.x && a.max.x > b.min.x && a.min.y < b.max.y
+        && a.max.y > b.min.y
+    );
+}
+
+void World::simulate_gravity(Object* object, float delta_time) {
+    object->force =
+        Vector2Add(object->force, Vector2Scale(this->world_gravity, object->mass));
+}
+
+void World::update_spatial_grid() {
+    m_spatial_grid.clear();
+
+    for (ObjectID object_id : *this) {
+        Object* object = get_object(object_id);
+        if (object == nullptr) {
+            continue;
+        }
+
+        AABB box = compute_AABB(*object);
+        int minX = static_cast<int>(std::floor(box.min.x / CELL_SIZE));
+        int maxX = static_cast<int>(std::floor(box.max.x / CELL_SIZE));
+        int minY = static_cast<int>(std::floor(box.min.y / CELL_SIZE));
+        int maxY = static_cast<int>(std::floor(box.max.y / CELL_SIZE));
+
+        for (int x = minX; x <= maxX; ++x) {
+            for (int y = minY; y <= maxY; ++y) {
+                m_spatial_grid[{ x, y }].push_back(object_id);
+            }
+        }
+    }
+}
+
+std::vector<ObjectID> World::query_region(const AABB& bounds) {
+    std::vector<ObjectID> result;
+    std::unordered_set<uint64_t> seen;
+
+    int minX = static_cast<int>(std::floor(bounds.min.x / CELL_SIZE));
+    int maxX = static_cast<int>(std::floor(bounds.max.x / CELL_SIZE));
+    int minY = static_cast<int>(std::floor(bounds.min.y / CELL_SIZE));
+    int maxY = static_cast<int>(std::floor(bounds.max.y / CELL_SIZE));
+
+    for (int x = minX; x <= maxX; ++x) {
+        for (int y = minY; y <= maxY; ++y) {
+            CellPosition key{ x, y };
+            auto it = m_spatial_grid.find(key);
+            if (it != m_spatial_grid.end()) {
+                for (ObjectID id : it->second) {
+                    uint64_t combined_unique_id = ((uint64_t)id.index << 32) | id.generation;
+                    if (seen.insert(combined_unique_id).second) { // this code only runs if the current object with the unique id is not in the seen vector
+                        result.push_back(id);
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+
+ObjectID World::create_object(math::Vector2 position, math::Vector2 size, float mass, ObjectType type) {
+    uint32_t curr_index = 0;
+    uint32_t curr_gen = 0;
+
+    if (m_free_indexes.empty()) {
+        curr_index = m_objects.size();
+        m_objects.push_back(Object{
+            .type = type, .position = position, .size = size, .mass = mass });
+        curr_gen = 0;
+        m_generations.push_back(curr_gen);
+    } else {
+        curr_index = m_free_indexes.back();
+        m_free_indexes.pop_back();
+        m_objects[curr_index] =
+            Object{ .type = type, .position = position, .size = size, .mass = mass };
+        curr_gen = m_generations[curr_index];
+    }
+    return ObjectID{ .index = curr_index, .generation = curr_gen };
+}
+Object* World::get_object(ObjectID object_id) {
+    if (object_id.index < m_objects.size()
+        && m_generations[object_id.index] == object_id.generation) {
+        return &m_objects[object_id.index];
+    }
+    return nullptr;
+}
+void World::destroy_object(ObjectID object_id) {
+    if (object_id.index < m_objects.size()
+        && m_generations[object_id.index] == object_id.generation) {
+        m_generations[object_id.index] += 1;
+        m_free_indexes.push_back(object_id.index);
+    }
+};
+const std::vector<Collision>& World::get_collisions() const {
+    return m_collisions;
+}
+bool World::is_colliding(ObjectID id) const {
+    return std::ranges::any_of(m_collisions, [id](Collision collision) {
+        return collision.a == id || collision.b == id;
+    });
+}
+bool World::are_colliding(ObjectID a, ObjectID b) const {
+    return std::ranges::any_of(m_collisions, [a, b](Collision collision) {
+        return (collision.a == a && collision.b == b)
+            || (collision.a == b && collision.b == a);
+    });
+}
+std::vector<Collision> World::get_collisions_for(ObjectID id) const {
+    std::vector<Collision> result;
+    for (const auto& col : m_collisions) {
+        if (col.a == id || col.b == id) {
+            result.push_back(col);
+        }
+    }
+    return result;
+}
+void World::step(float delta_time) {
+    for (ObjectID object_id : *this) {
+        Object* object = this->get_object(object_id);
+        // skip a null pointer or a sleeping object
+        if (object == nullptr || object->is_sleeping) {
+            continue;
+        }
+
+        // only apply these motion dynamics if the body type is dynamic
+        if (object->type == ObjectType::DYNAMIC) {
+            World::simulate_gravity(object, delta_time);
+
+            math::Vector2 acceleration =
+                Vector2Scale(object->force, 1.0F / object->mass);
+            object->velocity =
+                Vector2Add(object->velocity, Vector2Scale(acceleration, delta_time));
+            object->position =
+                Vector2Add(object->position, Vector2Scale(object->velocity, delta_time));
+
+            // reset the force on the all the objects for the next frame
+            object->force = math::Vector2(0, 0);
+        }
+
+        // if an object's velocity is below the sleep threshold, then we put the object to sleep
+        if (math::Vector2LengthSquared(object->velocity) < SLEEP_LINEAR_THRESHOLD) {
+            object->sleep_timer += delta_time;
+            if (object->sleep_timer > SLEEP_TIME_THRESHOLD) {
+                object->is_sleeping = true;
+                object->velocity = math::Vector2(0, 0); // Ensure no drift
+            }
+        } else {
+            object->sleep_timer = 0.0F;
+        }
+    }
+
+    // now that all motion computation is done and objects have been moved, we update the spatial grid to represent those changes
+    this->update_spatial_grid();
+
+    m_collisions.clear();
+    std::unordered_set<uint64_t> checked_pairs;
+    for (ObjectID a_id : *this) {
+        Object* a = get_object(a_id);
+        if (a == nullptr) {
+            continue;
+        }
+
+        AABB a_box = compute_AABB(*a);
+        std::vector<ObjectID> nearby_objects = query_region(a_box);
+        for (ObjectID b_id : nearby_objects) {
+            if (a_id == b_id) {
+                continue;
+            }
+            Object* b = get_object(b_id);
+            if (b == nullptr) {
+                continue;
+            }
+
+            // avoid duplicate pairs
+            uint64_t smaller = std::min(a_id.index, b_id.index);
+            uint64_t larger = std::max(a_id.index, b_id.index);
+            uint64_t pair_key = (smaller << 32) | larger;
+            if (!checked_pairs.insert(pair_key).second) {
+                continue;
+            }
+
+            AABB b_box = compute_AABB(*b);
+            if (AABB_overlap(a_box, b_box)) {
+                m_collisions.push_back(Collision{ a_id, b_id });
+            }
+        }
+    }
+};
+
+} // namespace nuck
